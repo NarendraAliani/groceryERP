@@ -7,3 +7,5 @@ RewriteEngine On
 RewriteRule ^(config|app|logs)(/|$) - [F,L]
 RewriteRule ^database\.sql$ - [F,L,NC]
 RewriteRule ^(.*/)?\.env$ - [F,L,NC]
+RewriteRule ^public(/|$) - [L]
+RewriteRule ^(.+)$ public/$1 [QSA,L]
