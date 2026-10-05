@@ -245,10 +245,17 @@ CREATE PROCEDURE Sp_CompleteCheckoutTransaction(
 SQL SECURITY INVOKER
 BEGIN
  DECLARE v_done INT DEFAULT 0;
+ DECLARE v_item_index INT DEFAULT 0;
+ DECLARE v_payment_index INT DEFAULT 0;
+ DECLARE v_item_count INT DEFAULT 0;
+ DECLARE v_payment_count INT DEFAULT 0;
  DECLARE v_batch_id BIGINT UNSIGNED;
  DECLARE v_quantity DECIMAL(18,3);
  DECLARE v_unit_price DECIMAL(14,2);
  DECLARE v_discount DECIMAL(14,2);
+ DECLARE v_mode VARCHAR(10);
+ DECLARE v_amount DECIMAL(14,2);
+ DECLARE v_reference VARCHAR(120);
  DECLARE v_product_id INT UNSIGNED;
  DECLARE v_cgst_rate DECIMAL(5,2);
  DECLARE v_sgst_rate DECIMAL(5,2);
@@ -267,9 +274,8 @@ BEGIN
  DECLARE v_invoice_id BIGINT UNSIGNED;
  DECLARE v_store_state CHAR(2);
  DECLARE v_company_state CHAR(2);
- DECLARE v_msg TEXT DEFAULT 'Checkout failed.';
- DECLARE cur CURSOR FOR SELECT batch_id,quantity,unit_price,discount_amount FROM tmp_checkout_items ORDER BY item_seq;
- DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=1;
+ DECLARE v_msg VARCHAR(255) DEFAULT 'Checkout failed.';
+
  DECLARE EXIT HANDLER FOR SQLEXCEPTION
  BEGIN
   ROLLBACK;
@@ -304,14 +310,18 @@ BEGIN
   discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00
  ) ENGINE=InnoDB;
 
- INSERT INTO tmp_checkout_items(batch_id,quantity,unit_price,discount_amount)
- SELECT batch_id,quantity,unit_price,COALESCE(discount_amount,0.00)
- FROM JSON_TABLE(p_items,'$[*]' COLUMNS(
-  batch_id BIGINT UNSIGNED PATH '$.batch_id',
-  quantity DECIMAL(18,3) PATH '$.quantity',
-  unit_price DECIMAL(14,2) PATH '$.unit_price',
-  discount_amount DECIMAL(14,2) PATH '$.discount_amount' DEFAULT 0 ON EMPTY
- )) j;
+ SET v_item_count=JSON_LENGTH(p_items);
+ SET v_item_index=0;
+ WHILE v_item_index<v_item_count DO
+  INSERT INTO tmp_checkout_items(batch_id,quantity,unit_price,discount_amount)
+  VALUES(
+   CAST(JSON_UNQUOTE(JSON_EXTRACT(p_items,CONCAT('$[',v_item_index,'].batch_id'))) AS UNSIGNED),
+   CAST(JSON_UNQUOTE(JSON_EXTRACT(p_items,CONCAT('$[',v_item_index,'].quantity'))) AS DECIMAL(18,3)),
+   CAST(JSON_UNQUOTE(JSON_EXTRACT(p_items,CONCAT('$[',v_item_index,'].unit_price'))) AS DECIMAL(14,2)),
+   COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(p_items,CONCAT('$[',v_item_index,'].discount_amount'))) AS DECIMAL(14,2)),0.00)
+  );
+  SET v_item_index=v_item_index+1;
+ END WHILE;
 
  IF EXISTS(SELECT 1 FROM tmp_checkout_items WHERE quantity<=0 OR unit_price<0 OR discount_amount<0) THEN
   SET v_msg='Invalid quantity, price or discount.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
@@ -325,59 +335,68 @@ BEGIN
   reference_no VARCHAR(120) NULL
  ) ENGINE=InnoDB;
 
- INSERT INTO tmp_checkout_payments(mode,amount,reference_no)
- SELECT mode,amount,reference_no
- FROM JSON_TABLE(p_payments,'$[*]' COLUMNS(
-  mode VARCHAR(10) PATH '$.mode',
-  amount DECIMAL(14,2) PATH '$.amount',
-  reference_no VARCHAR(120) PATH '$.reference_no' NULL ON EMPTY
- )) j;
+ SET v_payment_count=JSON_LENGTH(p_payments);
+ SET v_payment_index=0;
+ WHILE v_payment_index<v_payment_count DO
+  INSERT INTO tmp_checkout_payments(mode,amount,reference_no)
+  VALUES(
+   JSON_UNQUOTE(JSON_EXTRACT(p_payments,CONCAT('$[',v_payment_index,'].mode'))),
+   CAST(JSON_UNQUOTE(JSON_EXTRACT(p_payments,CONCAT('$[',v_payment_index,'].amount'))) AS DECIMAL(14,2)),
+   JSON_UNQUOTE(JSON_EXTRACT(p_payments,CONCAT('$[',v_payment_index,'].reference_no')))
+  );
+  SET v_payment_index=v_payment_index+1;
+ END WHILE;
 
  IF EXISTS(SELECT 1 FROM tmp_checkout_payments WHERE mode NOT IN('Cash','Card','UPI') OR amount<=0) THEN
   SET v_msg='Invalid payment mode or amount.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
  END IF;
 
- OPEN cur;
- item_loop: LOOP
-  FETCH cur INTO v_batch_id,v_quantity,v_unit_price,v_discount;
-  IF v_done=1 THEN LEAVE item_loop; END IF;
+ SET v_done=0;
+ BEGIN
+  DECLARE cur CURSOR FOR SELECT batch_id,quantity,unit_price,discount_amount FROM tmp_checkout_items ORDER BY item_seq;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=1;
+  OPEN cur;
+  item_loop: LOOP
+   FETCH cur INTO v_batch_id,v_quantity,v_unit_price,v_discount;
+   IF v_done=1 THEN LEAVE item_loop; END IF;
 
-  SET v_product_id=NULL; SET v_stock=NULL;
-  SELECT b.product_id,p.cgst_rate,p.sgst_rate,p.igst_rate,b.current_stock
-  INTO v_product_id,v_cgst_rate,v_sgst_rate,v_igst_rate,v_stock
-  FROM inventory_batches b JOIN products p ON p.product_id=b.product_id
-  WHERE b.batch_id=v_batch_id AND b.store_id=p_store_id AND p.is_active=1
-  FOR UPDATE;
+   SET v_product_id=NULL; SET v_stock=NULL;
+   SELECT b.product_id,p.cgst_rate,p.sgst_rate,p.igst_rate,b.current_stock
+   INTO v_product_id,v_cgst_rate,v_sgst_rate,v_igst_rate,v_stock
+   FROM inventory_batches b JOIN products p ON p.product_id=b.product_id
+   WHERE b.batch_id=v_batch_id AND b.store_id=p_store_id AND p.is_active=1
+   FOR UPDATE;
 
-  IF v_product_id IS NULL THEN
-   SET v_msg='Batch is not valid for this store.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
-  END IF;
-  IF v_stock<v_quantity THEN
-   SET v_msg='Insufficient batch stock.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
-  END IF;
+   IF v_product_id IS NULL THEN
+    SET v_msg='Batch is not valid for this store.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
+   END IF;
+   IF v_stock<v_quantity THEN
+    SET v_msg='Insufficient batch stock.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
+   END IF;
 
-  SET v_taxable=ROUND(v_quantity*v_unit_price-v_discount,2);
-  IF v_taxable<0 THEN
-   SET v_msg='Discount exceeds line value.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
-  END IF;
+   SET v_taxable=ROUND(v_quantity*v_unit_price-v_discount,2);
+   IF v_taxable<0 THEN
+    SET v_msg='Discount exceeds line value.'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=v_msg;
+   END IF;
 
-  IF v_store_state=v_company_state THEN
-   SET v_cgst=ROUND(v_taxable*v_cgst_rate/100,2);
-   SET v_sgst=ROUND(v_taxable*v_sgst_rate/100,2);
-   SET v_igst=0.00;
-  ELSE
-   SET v_cgst=0.00; SET v_sgst=0.00;
-   SET v_igst=ROUND(v_taxable*v_igst_rate/100,2);
-  END IF;
+   IF v_store_state=v_company_state THEN
+    SET v_cgst=ROUND(v_taxable*v_cgst_rate/100,2);
+    SET v_sgst=ROUND(v_taxable*v_sgst_rate/100,2);
+    SET v_igst=0.00;
+   ELSE
+    SET v_cgst=0.00; SET v_sgst=0.00;
+    SET v_igst=ROUND(v_taxable*v_igst_rate/100,2);
+   END IF;
 
-  SET v_subtotal=ROUND(v_subtotal+v_taxable,2);
-  SET v_total_cgst=ROUND(v_total_cgst+v_cgst,2);
-  SET v_total_sgst=ROUND(v_total_sgst+v_sgst,2);
-  SET v_total_igst=ROUND(v_total_igst+v_igst,2);
+   SET v_subtotal=ROUND(v_subtotal+v_taxable,2);
+   SET v_total_cgst=ROUND(v_total_cgst+v_cgst,2);
+   SET v_total_sgst=ROUND(v_total_sgst+v_sgst,2);
+   SET v_total_igst=ROUND(v_total_igst+v_igst,2);
 
-  UPDATE inventory_batches SET current_stock=current_stock-v_quantity WHERE batch_id=v_batch_id;
- END LOOP;
- CLOSE cur;
+   UPDATE inventory_batches SET current_stock=current_stock-v_quantity WHERE batch_id=v_batch_id;
+  END LOOP;
+  CLOSE cur;
+ END;
 
  SET v_grand_total=ROUND(v_subtotal+v_total_cgst+v_total_sgst+v_total_igst,2);
  SELECT COALESCE(SUM(amount),0.00) INTO v_payment_total FROM tmp_checkout_payments;
@@ -415,7 +434,6 @@ BEGIN
  COMMIT;
  DROP TEMPORARY TABLE IF EXISTS tmp_checkout_items;
  DROP TEMPORARY TABLE IF EXISTS tmp_checkout_payments;
-
  SELECT v_invoice_id AS invoice_id,p_invoice_number AS invoice_number,v_subtotal AS subtotal,
         v_total_cgst AS total_cgst,v_total_sgst AS total_sgst,v_total_igst AS total_igst,
         v_grand_total AS grand_total,'Paid' AS payment_status;
