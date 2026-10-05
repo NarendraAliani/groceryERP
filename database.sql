@@ -1,0 +1,2 @@
+-- groceryERP database deployment script
+-- Full schema and stored procedures are added in the next commit.
